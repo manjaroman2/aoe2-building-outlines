@@ -72,6 +72,15 @@ typedef struct
 
 typedef void (*dxt4_pixel_writer_t)(uint8_t *pixel, uint8_t c);
 
+typedef struct
+{
+    long read_start;
+    uint32_t content_length;
+    int actual_length;
+    uint16_t command_array_length;
+    command_t commands[MAX_COMMANDS];
+} sld_layer_t;
+
 uint8_t interpolate_single_channel_8(uint8_t c0, uint8_t c1, double f0, double f1)
 {
     return (uint8_t)(c0 * f0 + c1 * f1);
@@ -117,6 +126,48 @@ void write_playercolor_pixel(uint8_t *pixel, uint8_t c)
     pixel[1] = 0;
     pixel[2] = c;
     pixel[3] = c == 0 ? 0 : 255;
+}
+
+int begin_layer(FILE *f, const char *name, sld_layer_t *layer)
+{
+    layer->read_start = ftell(f);
+    if (fread(&layer->content_length, sizeof(uint32_t), 1, f) != 1)
+    {
+        return 0;
+    }
+
+    layer->actual_length = (layer->content_length + 3) & ~3;
+    printf("    %s\n      sld_layer_length=%d\n      actual_length=%d\n", name, layer->content_length,
+           layer->actual_length);
+    return 1;
+}
+
+int read_layer_commands(FILE *f, sld_layer_t *layer)
+{
+    if (fread(&layer->command_array_length, sizeof(uint16_t), 1, f) != 1)
+    {
+        return 0;
+    }
+
+    if (layer->command_array_length > MAX_COMMANDS)
+    {
+        printf("command_array_length %d is bigger than %d\n", layer->command_array_length, MAX_COMMANDS);
+        return 0;
+    }
+    printf("      command_array_length=%d\n", layer->command_array_length);
+    if (fread(layer->commands, sizeof(command_t), layer->command_array_length, f) != layer->command_array_length)
+    {
+        printf("commands err\n");
+        return 0;
+    }
+    return 1;
+}
+
+int finish_layer(FILE *f, sld_layer_t *layer)
+{
+    long read = ftell(f) - layer->read_start;
+    printf("      null bytes %ld\n", layer->actual_length - read);
+    return fseek(f, layer->actual_length - read, SEEK_CUR) == 0;
 }
 
 void decode_dxt4(bc4_t block, int block_x, int block_y, uint8_t *canvas, uint16_t offset_x1, uint16_t offset_y1,
@@ -248,15 +299,11 @@ int main(int argc, char **argv)
 
     if (sld_frame_header.frame_type & 1) // main graphic
     {
-        int layer_read_start = ftell(f);
-        uint32_t sld_layer_length;
-        if (fread(&sld_layer_length, sizeof(uint32_t), 1, f) != 1)
+        sld_layer_t layer = {0};
+        if (!begin_layer(f, "main", &layer))
         {
             return 1;
         }
-
-        int actual_length = (sld_layer_length + 3) & ~3;
-        printf("    main\n      sld_layer_length=%d\n      actual_length=%d\n", sld_layer_length, actual_length);
 
         sld_main_header_t sld_main_header = {0};
         if (fread(&sld_main_header, sizeof(sld_main_header_t), 1, f) != 1)
@@ -268,22 +315,8 @@ int main(int argc, char **argv)
         main_offset_x1 = sld_main_header.offset_x1;
         main_offset_y1 = sld_main_header.offset_y1;
         main_width = sld_main_header.offset_x2 - sld_main_header.offset_x1;
-        uint16_t command_array_length;
-        if (fread(&command_array_length, sizeof(uint16_t), 1, f) != 1)
+        if (!read_layer_commands(f, &layer))
         {
-            return 1;
-        }
-
-        if (command_array_length > MAX_COMMANDS)
-        {
-            printf("command_array_length %d is bigger than %d\n", command_array_length, MAX_COMMANDS);
-            return 1;
-        }
-        printf("      command_array_length=%d\n", command_array_length);
-        command_t commands[MAX_COMMANDS];
-        if (fread(commands, sizeof(command_t), command_array_length, f) != command_array_length)
-        {
-            printf("commands err\n");
             return 1;
         }
 
@@ -293,9 +326,9 @@ int main(int argc, char **argv)
 
         int block_x = 0;
         int block_y = 0;
-        for (int i = 0; i < command_array_length; i++)
+        for (int i = 0; i < layer.command_array_length; i++)
         {
-            command_t cmd = commands[i];
+            command_t cmd = layer.commands[i];
 
             int drawn = cmd.drawn;
             int skipped = cmd.skipped;
@@ -319,21 +352,18 @@ int main(int argc, char **argv)
                 block_x = (block_x + 1) % blocks_wide;
             }
         }
-        int read = ftell(f) - layer_read_start;
-        printf("      null bytes %d\n", actual_length - read);
-        fseek(f, actual_length - read, SEEK_CUR);
-    }
-    if (sld_frame_header.frame_type & 2) // shadow
-    {
-        int layer_read_start = ftell(f);
-        uint32_t sld_layer_length;
-        if (fread(&sld_layer_length, sizeof(uint32_t), 1, f) != 1)
+        if (!finish_layer(f, &layer))
         {
             return 1;
         }
-
-        int actual_length = (sld_layer_length + 3) & ~3;
-        printf("    shadow\n      sld_layer_length=%d\n      actual_length=%d\n", sld_layer_length, actual_length);
+    }
+    if (sld_frame_header.frame_type & 2) // shadow
+    {
+        sld_layer_t layer = {0};
+        if (!begin_layer(f, "shadow", &layer))
+        {
+            return 1;
+        }
 
         sld_shadow_header_t sld_shadow_header = {0};
         if (fread(&sld_shadow_header, sizeof(sld_shadow_header_t), 1, f) != 1)
@@ -342,22 +372,8 @@ int main(int argc, char **argv)
         }
         printf("      flag1=" BYTE_TO_BINARY_PATTERN "\n", BYTE_TO_BINARY(sld_shadow_header.flag1));
         int width = sld_shadow_header.offset_x2 - sld_shadow_header.offset_x1;
-        uint16_t command_array_length;
-        if (fread(&command_array_length, sizeof(uint16_t), 1, f) != 1)
+        if (!read_layer_commands(f, &layer))
         {
-            return 1;
-        }
-
-        if (command_array_length > MAX_COMMANDS)
-        {
-            printf("command_array_length %d is bigger than %d\n", command_array_length, MAX_COMMANDS);
-            return 1;
-        }
-        printf("      command_array_length=%d\n", command_array_length);
-        command_t commands[MAX_COMMANDS];
-        if (fread(commands, sizeof(command_t), command_array_length, f) != command_array_length)
-        {
-            printf("commands err\n");
             return 1;
         }
 
@@ -367,9 +383,9 @@ int main(int argc, char **argv)
 
         int block_x = 0;
         int block_y = 0;
-        for (int i = 0; i < command_array_length; i++)
+        for (int i = 0; i < layer.command_array_length; i++)
         {
-            command_t cmd = commands[i];
+            command_t cmd = layer.commands[i];
 
             int drawn = cmd.drawn;
             int skipped = cmd.skipped;
@@ -394,57 +410,48 @@ int main(int argc, char **argv)
                 block_x = (block_x + 1) % blocks_wide;
             }
         }
-        int read = ftell(f) - layer_read_start;
-        printf("      null bytes %d\n", actual_length - read);
-        fseek(f, actual_length - read, SEEK_CUR);
+        if (!finish_layer(f, &layer))
+        {
+            return 1;
+        }
     }
     if (sld_frame_header.frame_type & 4) // ???
     {
-        int layer_read_start = ftell(f);
-        uint32_t sld_layer_length;
-        if (fread(&sld_layer_length, sizeof(uint32_t), 1, f) != 1)
+        sld_layer_t layer = {0};
+        if (!begin_layer(f, "???", &layer))
         {
             return 1;
         }
-
-        int actual_length = (sld_layer_length + 3) & ~3;
-        printf("    ???\n      sld_layer_length=%d\n      actual_length=%d\n", sld_layer_length, actual_length);
-        int read = ftell(f) - layer_read_start;
-        printf("      null bytes %d\n", actual_length - read);
-        fseek(f, actual_length - read, SEEK_CUR);
+        if (!finish_layer(f, &layer))
+        {
+            return 1;
+        }
     }
     if (sld_frame_header.frame_type & 8) // damage mask
     {
-        int layer_read_start = ftell(f);
-        uint32_t sld_layer_length;
-        if (fread(&sld_layer_length, sizeof(uint32_t), 1, f) != 1)
+        sld_layer_t layer = {0};
+        if (!begin_layer(f, "damage", &layer))
         {
             return 1;
         }
-
-        int actual_length = (sld_layer_length + 3) & ~3;
-        printf("    damage\n      sld_layer_length=%d\n      actual_length=%d\n", sld_layer_length, actual_length);
-        int read = ftell(f) - layer_read_start;
-        printf("      null bytes %d\n", actual_length - read);
-        fseek(f, actual_length - read, SEEK_CUR);
+        if (!finish_layer(f, &layer))
+        {
+            return 1;
+        }
     }
     if (sld_frame_header.frame_type & 16) // player color mask
     {
-        int layer_read_start = ftell(f);
         if ((sld_frame_header.frame_type & 1) == 0)
         {
             printf("playercolor mask requires main graphic layer\n");
             return 1;
         }
 
-        uint32_t sld_layer_length;
-        if (fread(&sld_layer_length, sizeof(uint32_t), 1, f) != 1)
+        sld_layer_t layer = {0};
+        if (!begin_layer(f, "playercolor", &layer))
         {
             return 1;
         }
-
-        int actual_length = (sld_layer_length + 3) & ~3;
-        printf("    playercolor\n      sld_layer_length=%d\n      actual_length=%d\n", sld_layer_length, actual_length);
 
         sld_playercolor_mask_header_t sld_playercolor_header = {0};
         if (fread(&sld_playercolor_header, sizeof(sld_playercolor_mask_header_t), 1, f) != 1)
@@ -453,22 +460,8 @@ int main(int argc, char **argv)
         }
         printf("      flag1=" BYTE_TO_BINARY_PATTERN "\n", BYTE_TO_BINARY(sld_playercolor_header.flag1));
 
-        uint16_t command_array_length;
-        if (fread(&command_array_length, sizeof(uint16_t), 1, f) != 1)
+        if (!read_layer_commands(f, &layer))
         {
-            return 1;
-        }
-
-        if (command_array_length > MAX_COMMANDS)
-        {
-            printf("command_array_length %d is bigger than %d\n", command_array_length, MAX_COMMANDS);
-            return 1;
-        }
-        printf("      command_array_length=%d\n", command_array_length);
-        command_t commands[MAX_COMMANDS];
-        if (fread(commands, sizeof(command_t), command_array_length, f) != command_array_length)
-        {
-            printf("commands err\n");
             return 1;
         }
 
@@ -478,9 +471,9 @@ int main(int argc, char **argv)
 
         int block_x = 0;
         int block_y = 0;
-        for (int i = 0; i < command_array_length; i++)
+        for (int i = 0; i < layer.command_array_length; i++)
         {
-            command_t cmd = commands[i];
+            command_t cmd = layer.commands[i];
 
             int drawn = cmd.drawn;
             int skipped = cmd.skipped;
@@ -505,9 +498,10 @@ int main(int argc, char **argv)
                 block_x = (block_x + 1) % blocks_wide;
             }
         }
-        int read = ftell(f) - layer_read_start;
-        printf("      null bytes %d\n", actual_length - read);
-        fseek(f, actual_length - read, SEEK_CUR);
+        if (!finish_layer(f, &layer))
+        {
+            return 1;
+        }
     }
 
     uint8_t *image_canvas = calloc(canvas_size, sizeof(uint8_t));
