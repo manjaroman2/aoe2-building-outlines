@@ -1,0 +1,4 @@
+*
+!.gitignore
+!sld.c
+!stb_image_write.h
