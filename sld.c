@@ -70,6 +70,8 @@ typedef struct
     uint8_t pix_indices[6];
 } bc4_t;
 
+typedef void (*dxt4_pixel_writer_t)(uint8_t *pixel, uint8_t c);
+
 uint8_t interpolate_single_channel_8(uint8_t c0, uint8_t c1, double f0, double f1)
 {
     return (uint8_t)(c0 * f0 + c1 * f1);
@@ -101,8 +103,24 @@ char *filename(char *path)
     return fn;
 }
 
-void decode_dxt4(bc4_t block, int block_x, int block_y, int width, uint8_t *image, uint8_t *canvas, uint16_t offset_x1,
-                 uint16_t offset_y1, uint16_t canvas_width)
+void write_shadow_pixel(uint8_t *pixel, uint8_t c)
+{
+    pixel[0] = 0;
+    pixel[1] = 0;
+    pixel[2] = 0;
+    pixel[3] = c;
+}
+
+void write_playercolor_pixel(uint8_t *pixel, uint8_t c)
+{
+    pixel[0] = 0;
+    pixel[1] = 0;
+    pixel[2] = c;
+    pixel[3] = c == 0 ? 0 : 255;
+}
+
+void decode_dxt4(bc4_t block, int block_x, int block_y, uint8_t *canvas, uint16_t offset_x1, uint16_t offset_y1,
+                 uint16_t canvas_width, dxt4_pixel_writer_t write_pixel)
 {
     uint16_t colors[8];
     colors[0] = block.color0;
@@ -127,8 +145,6 @@ void decode_dxt4(bc4_t block, int block_x, int block_y, int width, uint8_t *imag
         colors[7] = 255;
     }
 
-    // printf("%d,%d\n", block_x, block_y);
-
     uint64_t pix = 0;
     int shift = 0;
     for (int p = 0; p < 6; p++)
@@ -144,25 +160,16 @@ void decode_dxt4(bc4_t block, int block_x, int block_y, int width, uint8_t *imag
 
         int px = block_x * 4 + (k % 4);
         int py = block_y * 4 + (k / 4);
-        int idx = (py * width + px) * 4;
-
-        image[idx + 0] = 0;
-        image[idx + 1] = 0;
-        image[idx + 2] = 0;
-        image[idx + 3] = c;
 
         int canvas_px = offset_x1 + px;
         int canvas_py = offset_y1 + py;
         int canvas_idx = (canvas_py * canvas_width + canvas_px) * 4;
-        canvas[canvas_idx + 0] = image[idx + 0];
-        canvas[canvas_idx + 1] = image[idx + 1];
-        canvas[canvas_idx + 2] = image[idx + 2];
-        canvas[canvas_idx + 3] = image[idx + 3];
+        write_pixel(canvas + canvas_idx, c);
     }
 }
 
-void decode_dxt1(bc1_t block, int block_x, int block_y, int width, uint8_t *image, uint8_t *canvas, uint16_t offset_x1,
-                 uint16_t offset_y1, uint16_t canvas_width)
+void decode_dxt1(bc1_t block, int block_x, int block_y, uint8_t *canvas, uint16_t offset_x1, uint16_t offset_y1,
+                 uint16_t canvas_width)
 {
     uint16_t colors[4];
     colors[0] = block.color0;
@@ -179,8 +186,6 @@ void decode_dxt1(bc1_t block, int block_x, int block_y, int width, uint8_t *imag
         colors[3] = 0;
     }
 
-    // printf("%d,%d\n", block_x, block_y);
-
     uint32_t pix = block.pix_indices;
     for (int k = 0; k < 16; k++)
     {
@@ -190,20 +195,14 @@ void decode_dxt1(bc1_t block, int block_x, int block_y, int width, uint8_t *imag
 
         int px = block_x * 4 + (k % 4);
         int py = block_y * 4 + (k / 4);
-        int idx = (py * width + px) * 4;
-
-        image[idx + 0] = ((c >> 11) & 0x1F) * 255 / 31;
-        image[idx + 1] = ((c >> 5) & 0x3F) * 255 / 63;
-        image[idx + 2] = (c & 0x1F) * 255 / 31;
-        image[idx + 3] = (colors[0] <= colors[1] && color_idx == 3) ? 0 : 255;
 
         int canvas_px = offset_x1 + px;
         int canvas_py = offset_y1 + py;
         int canvas_idx = (canvas_py * canvas_width + canvas_px) * 4;
-        canvas[canvas_idx + 0] = image[idx + 0];
-        canvas[canvas_idx + 1] = image[idx + 1];
-        canvas[canvas_idx + 2] = image[idx + 2];
-        canvas[canvas_idx + 3] = image[idx + 3];
+        canvas[canvas_idx + 0] = ((c >> 11) & 0x1F) * 255 / 31;
+        canvas[canvas_idx + 1] = ((c >> 5) & 0x3F) * 255 / 63;
+        canvas[canvas_idx + 2] = (c & 0x1F) * 255 / 31;
+        canvas[canvas_idx + 3] = (colors[0] <= colors[1] && color_idx == 3) ? 0 : 255;
     }
 }
 
@@ -244,11 +243,12 @@ int main(int argc, char **argv)
     uint8_t *shadow_canvas = calloc(canvas_size, sizeof(uint8_t));
     uint8_t *playercolor_canvas = calloc(canvas_size, sizeof(uint8_t));
 
-    int main_width, main_height;
-    uint16_t main_offset_x1, main_offset_y1;
+    int main_width = 0;
+    uint16_t main_offset_x1 = 0, main_offset_y1 = 0;
 
     if (sld_frame_header.frame_type & 1) // main graphic
     {
+        int layer_read_start = ftell(f);
         uint32_t sld_layer_length;
         if (fread(&sld_layer_length, sizeof(uint32_t), 1, f) != 1)
         {
@@ -256,19 +256,18 @@ int main(int argc, char **argv)
         }
 
         int actual_length = (sld_layer_length + 3) & ~3;
-        printf("    sld_layer_length=%d\n    actual_length=%d\n", sld_layer_length, actual_length);
+        printf("    main\n      sld_layer_length=%d\n      actual_length=%d\n", sld_layer_length, actual_length);
 
         sld_main_header_t sld_main_header = {0};
         if (fread(&sld_main_header, sizeof(sld_main_header_t), 1, f) != 1)
         {
             return 1;
         }
-        printf("    main_graphic flag1=" BYTE_TO_BINARY_PATTERN "\n", BYTE_TO_BINARY(sld_main_header.flag1));
+
+        printf("      flag1=" BYTE_TO_BINARY_PATTERN "\n", BYTE_TO_BINARY(sld_main_header.flag1));
         main_offset_x1 = sld_main_header.offset_x1;
         main_offset_y1 = sld_main_header.offset_y1;
         main_width = sld_main_header.offset_x2 - sld_main_header.offset_x1;
-        main_height = sld_main_header.offset_y2 - sld_main_header.offset_y1;
-
         uint16_t command_array_length;
         if (fread(&command_array_length, sizeof(uint16_t), 1, f) != 1)
         {
@@ -280,7 +279,7 @@ int main(int argc, char **argv)
             printf("command_array_length %d is bigger than %d\n", command_array_length, MAX_COMMANDS);
             return 1;
         }
-        printf("    command_array_length=%d\n", command_array_length);
+        printf("      command_array_length=%d\n", command_array_length);
         command_t commands[MAX_COMMANDS];
         if (fread(commands, sizeof(command_t), command_array_length, f) != command_array_length)
         {
@@ -288,10 +287,7 @@ int main(int argc, char **argv)
             return 1;
         }
 
-        uint8_t *image = calloc(main_width * main_height * 4, sizeof(uint8_t));
-
         int blocks_wide = main_width / 4;
-        int blocks_tall = main_height / 4;
         // printf("width=%d height=%d\n", width, height);
         // printf("blocks=%dx%d\n", blocks_wide, blocks_tall);
 
@@ -316,21 +312,20 @@ int main(int argc, char **argv)
                     printf("block err\n");
                     return 1;
                 }
-                decode_dxt1(block, block_x, block_y, main_width, image, main_canvas, sld_main_header.offset_x1,
-                            sld_main_header.offset_y1, sld_frame_header.canvas_width);
+                decode_dxt1(block, block_x, block_y, main_canvas, sld_main_header.offset_x1, sld_main_header.offset_y1,
+                            sld_frame_header.canvas_width);
 
                 block_y += (block_x + 1) / blocks_wide;
                 block_x = (block_x + 1) % blocks_wide;
             }
         }
-        char png[128];
-        snprintf(png, sizeof(png), "out/%s_main.png", fn);
-        mkdir("out", 0755);
-        stbi_write_png(png, main_width, main_height, 4, image, main_width * 4);
-        free(image);
+        int read = ftell(f) - layer_read_start;
+        printf("      null bytes %d\n", actual_length - read);
+        fseek(f, actual_length - read, SEEK_CUR);
     }
     if (sld_frame_header.frame_type & 2) // shadow
     {
+        int layer_read_start = ftell(f);
         uint32_t sld_layer_length;
         if (fread(&sld_layer_length, sizeof(uint32_t), 1, f) != 1)
         {
@@ -338,17 +333,15 @@ int main(int argc, char **argv)
         }
 
         int actual_length = (sld_layer_length + 3) & ~3;
-        printf("    sld_layer_length=%d\n    actual_length=%d\n", sld_layer_length, actual_length);
+        printf("    shadow\n      sld_layer_length=%d\n      actual_length=%d\n", sld_layer_length, actual_length);
 
         sld_shadow_header_t sld_shadow_header = {0};
         if (fread(&sld_shadow_header, sizeof(sld_shadow_header_t), 1, f) != 1)
         {
             return 1;
         }
-        printf("    shadow flag1=" BYTE_TO_BINARY_PATTERN "\n", BYTE_TO_BINARY(sld_shadow_header.flag1));
+        printf("      flag1=" BYTE_TO_BINARY_PATTERN "\n", BYTE_TO_BINARY(sld_shadow_header.flag1));
         int width = sld_shadow_header.offset_x2 - sld_shadow_header.offset_x1;
-        int height = sld_shadow_header.offset_y2 - sld_shadow_header.offset_y1;
-
         uint16_t command_array_length;
         if (fread(&command_array_length, sizeof(uint16_t), 1, f) != 1)
         {
@@ -360,7 +353,7 @@ int main(int argc, char **argv)
             printf("command_array_length %d is bigger than %d\n", command_array_length, MAX_COMMANDS);
             return 1;
         }
-        printf("    command_array_length=%d\n", command_array_length);
+        printf("      command_array_length=%d\n", command_array_length);
         command_t commands[MAX_COMMANDS];
         if (fread(commands, sizeof(command_t), command_array_length, f) != command_array_length)
         {
@@ -368,10 +361,7 @@ int main(int argc, char **argv)
             return 1;
         }
 
-        uint8_t *image = calloc(width * height * 4, sizeof(uint8_t));
-
         int blocks_wide = width / 4;
-        int blocks_tall = height / 4;
         // printf("width=%d height=%d\n", width, height);
         // printf("blocks=%dx%d\n", blocks_wide, blocks_tall);
 
@@ -397,27 +387,20 @@ int main(int argc, char **argv)
                     return 1;
                 }
 
-                decode_dxt4(block, block_x, block_y, width, image, shadow_canvas, sld_shadow_header.offset_x1,
-                            sld_shadow_header.offset_y1, sld_frame_header.canvas_width);
+                decode_dxt4(block, block_x, block_y, shadow_canvas, sld_shadow_header.offset_x1,
+                            sld_shadow_header.offset_y1, sld_frame_header.canvas_width, write_shadow_pixel);
 
                 block_y += (block_x + 1) / blocks_wide;
                 block_x = (block_x + 1) % blocks_wide;
             }
         }
-        char png[128];
-        snprintf(png, sizeof(png), "out/%s_shadow.png", fn);
-        mkdir("out", 0755);
-        stbi_write_png(png, width, height, 4, image, width * 4);
-        free(image);
+        int read = ftell(f) - layer_read_start;
+        printf("      null bytes %d\n", actual_length - read);
+        fseek(f, actual_length - read, SEEK_CUR);
     }
     if (sld_frame_header.frame_type & 4) // ???
     {
-    }
-    if (sld_frame_header.frame_type & 8) // damage mask
-    {
-    }
-    if (sld_frame_header.frame_type & 16) // player color mask
-    {
+        int layer_read_start = ftell(f);
         uint32_t sld_layer_length;
         if (fread(&sld_layer_length, sizeof(uint32_t), 1, f) != 1)
         {
@@ -425,14 +408,50 @@ int main(int argc, char **argv)
         }
 
         int actual_length = (sld_layer_length + 3) & ~3;
-        printf("    sld_layer_length=%d\n    actual_length=%d\n", sld_layer_length, actual_length);
+        printf("    ???\n      sld_layer_length=%d\n      actual_length=%d\n", sld_layer_length, actual_length);
+        int read = ftell(f) - layer_read_start;
+        printf("      null bytes %d\n", actual_length - read);
+        fseek(f, actual_length - read, SEEK_CUR);
+    }
+    if (sld_frame_header.frame_type & 8) // damage mask
+    {
+        int layer_read_start = ftell(f);
+        uint32_t sld_layer_length;
+        if (fread(&sld_layer_length, sizeof(uint32_t), 1, f) != 1)
+        {
+            return 1;
+        }
+
+        int actual_length = (sld_layer_length + 3) & ~3;
+        printf("    damage\n      sld_layer_length=%d\n      actual_length=%d\n", sld_layer_length, actual_length);
+        int read = ftell(f) - layer_read_start;
+        printf("      null bytes %d\n", actual_length - read);
+        fseek(f, actual_length - read, SEEK_CUR);
+    }
+    if (sld_frame_header.frame_type & 16) // player color mask
+    {
+        int layer_read_start = ftell(f);
+        if ((sld_frame_header.frame_type & 1) == 0)
+        {
+            printf("playercolor mask requires main graphic layer\n");
+            return 1;
+        }
+
+        uint32_t sld_layer_length;
+        if (fread(&sld_layer_length, sizeof(uint32_t), 1, f) != 1)
+        {
+            return 1;
+        }
+
+        int actual_length = (sld_layer_length + 3) & ~3;
+        printf("    playercolor\n      sld_layer_length=%d\n      actual_length=%d\n", sld_layer_length, actual_length);
 
         sld_playercolor_mask_header_t sld_playercolor_header = {0};
         if (fread(&sld_playercolor_header, sizeof(sld_playercolor_mask_header_t), 1, f) != 1)
         {
             return 1;
         }
-        printf("    playercolor flag1=" BYTE_TO_BINARY_PATTERN "\n", BYTE_TO_BINARY(sld_playercolor_header.flag1));
+        printf("      flag1=" BYTE_TO_BINARY_PATTERN "\n", BYTE_TO_BINARY(sld_playercolor_header.flag1));
 
         uint16_t command_array_length;
         if (fread(&command_array_length, sizeof(uint16_t), 1, f) != 1)
@@ -445,7 +464,7 @@ int main(int argc, char **argv)
             printf("command_array_length %d is bigger than %d\n", command_array_length, MAX_COMMANDS);
             return 1;
         }
-        printf("    command_array_length=%d\n", command_array_length);
+        printf("      command_array_length=%d\n", command_array_length);
         command_t commands[MAX_COMMANDS];
         if (fread(commands, sizeof(command_t), command_array_length, f) != command_array_length)
         {
@@ -453,10 +472,7 @@ int main(int argc, char **argv)
             return 1;
         }
 
-        uint8_t *image = calloc(main_width * main_height * 4, sizeof(uint8_t));
-
         int blocks_wide = main_width / 4;
-        int blocks_tall = main_height / 4;
         // printf("width=%d height=%d\n", width, height);
         // printf("blocks=%dx%d\n", blocks_wide, blocks_tall);
 
@@ -482,18 +498,16 @@ int main(int argc, char **argv)
                     return 1;
                 }
 
-                decode_dxt4(block, block_x, block_y, main_width, image, playercolor_canvas, main_offset_x1,
-                            main_offset_y1, sld_frame_header.canvas_width);
+                decode_dxt4(block, block_x, block_y, playercolor_canvas, main_offset_x1, main_offset_y1,
+                            sld_frame_header.canvas_width, write_playercolor_pixel);
 
                 block_y += (block_x + 1) / blocks_wide;
                 block_x = (block_x + 1) % blocks_wide;
             }
         }
-        char png[128];
-        snprintf(png, sizeof(png), "out/%s_playercolor.png", fn);
-        mkdir("out", 0755);
-        stbi_write_png(png, main_width, main_height, 4, image, main_width * 4);
-        free(image);
+        int read = ftell(f) - layer_read_start;
+        printf("      null bytes %d\n", actual_length - read);
+        fseek(f, actual_length - read, SEEK_CUR);
     }
 
     uint8_t *image_canvas = calloc(canvas_size, sizeof(uint8_t));
@@ -501,9 +515,9 @@ int main(int argc, char **argv)
     for (size_t idx = 0; idx < canvas_size; idx += 4)
     {
         uint8_t *dst = image_canvas + idx;
-        const uint8_t *src_layers[2] = {shadow_canvas + idx, main_canvas + idx};
+        const uint8_t *src_layers[3] = {shadow_canvas + idx, main_canvas + idx, playercolor_canvas + idx};
 
-        for (int layer = 0; layer < 2; layer++)
+        for (int layer = 0; layer < 3; layer++)
         {
             const uint8_t *src = src_layers[layer];
             uint32_t src_a = src[3];
@@ -532,14 +546,41 @@ int main(int argc, char **argv)
     }
 
     char png[128];
-    snprintf(png, sizeof(png), "out/%s.png", fn);
     mkdir("out", 0755);
+
+    snprintf(png, sizeof(png), "out/%s_main.png", fn);
+    stbi_write_png(png, sld_frame_header.canvas_width, sld_frame_header.canvas_height, 4, main_canvas,
+                   sld_frame_header.canvas_width * 4);
+
+    snprintf(png, sizeof(png), "out/%s_shadow.png", fn);
+    stbi_write_png(png, sld_frame_header.canvas_width, sld_frame_header.canvas_height, 4, shadow_canvas,
+                   sld_frame_header.canvas_width * 4);
+
+    snprintf(png, sizeof(png), "out/%s_playercolor.png", fn);
+    stbi_write_png(png, sld_frame_header.canvas_width, sld_frame_header.canvas_height, 4, playercolor_canvas,
+                   sld_frame_header.canvas_width * 4);
+
+    snprintf(png, sizeof(png), "out/%s.png", fn);
     stbi_write_png(png, sld_frame_header.canvas_width, sld_frame_header.canvas_height, 4, image_canvas,
                    sld_frame_header.canvas_width * 4);
 
     free(image_canvas);
     free(main_canvas);
     free(shadow_canvas);
+    free(playercolor_canvas);
+
+    long final_pos = ftell(f);
+    if (fseek(f, 0, SEEK_END) != 0)
+    {
+        return 1;
+    }
+    long file_size = ftell(f);
+    if (file_size < 0 || final_pos < 0)
+    {
+        return 1;
+    }
+    printf("file read check: %s (read=%ld size=%ld)\n", final_pos == file_size ? "complete" : "incomplete", final_pos,
+           file_size);
 
     fclose(f);
     return 0;
