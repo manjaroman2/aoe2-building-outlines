@@ -13,6 +13,12 @@
         ((byte) & 0x02 ? '1' : '0'), ((byte) & 0x01 ? '1' : '0')
 #define MAX_COMMANDS 1024
 
+#ifdef DEBUG
+#define DEBUG_PRINTF(...) printf(__VA_ARGS__)
+#else
+#define DEBUG_PRINTF(...) ((void)0)
+#endif
+
 typedef struct
 {
     char signature[4];
@@ -70,7 +76,10 @@ typedef struct
     uint8_t pix_indices[6];
 } bc4_t;
 
+typedef void (*dxt1_pixel_writer_t)(uint8_t *pixel, uint16_t c, int transparent);
 typedef void (*dxt4_pixel_writer_t)(uint8_t *pixel, uint8_t c);
+typedef void (*decode_method_t)(const void *block, int block_x, int block_y, uint8_t *canvas, uint16_t offset_x1,
+                                uint16_t offset_y1, uint16_t canvas_width, void *pixel_writer);
 
 typedef struct
 {
@@ -112,6 +121,76 @@ char *filename(char *path)
     return fn;
 }
 
+void stem(char *path, char *out, size_t out_size)
+{
+    char *fn = filename(path);
+    snprintf(out, out_size, "%s", fn);
+
+    char *dot = strrchr(out, '.');
+    if (dot != NULL)
+    {
+        *dot = '\0';
+    }
+}
+
+void output_path(char *out, size_t out_size, const char *stemmed, const char *filename, const char *suffix)
+{
+    snprintf(out, out_size, "out/%s/%s%s", stemmed, filename, suffix);
+}
+
+void draw_pixel(uint8_t *canvas, int canvas_width, int canvas_height, int x, int y, uint8_t r, uint8_t g, uint8_t b)
+{
+    if (x < 0 || x >= canvas_width || y < 0 || y >= canvas_height)
+    {
+        return;
+    }
+
+    int idx = (y * canvas_width + x) * 4;
+    canvas[idx + 0] = r;
+    canvas[idx + 1] = g;
+    canvas[idx + 2] = b;
+    canvas[idx + 3] = 255;
+}
+
+void draw_line(uint8_t *canvas, int canvas_width, int canvas_height, int x0, int y0, int x1, int y1, uint8_t r,
+               uint8_t g, uint8_t b)
+{
+    int dx = abs(x1 - x0);
+    int sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0);
+    int sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+
+    while (1)
+    {
+        draw_pixel(canvas, canvas_width, canvas_height, x0, y0, r, g, b);
+        if (x0 == x1 && y0 == y1)
+        {
+            break;
+        }
+
+        int e2 = 2 * err;
+        if (e2 >= dy)
+        {
+            err += dy;
+            x0 += sx;
+        }
+        if (e2 <= dx)
+        {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+void write_main_pixel(uint8_t *pixel, uint16_t c, int transparent)
+{
+    pixel[0] = ((c >> 11) & 0x1F) * 255 / 31;
+    pixel[1] = ((c >> 5) & 0x3F) * 255 / 63;
+    pixel[2] = (c & 0x1F) * 255 / 31;
+    pixel[3] = transparent ? 0 : 255;
+}
+
 void write_shadow_pixel(uint8_t *pixel, uint8_t c)
 {
     pixel[0] = 0;
@@ -130,6 +209,7 @@ void write_playercolor_pixel(uint8_t *pixel, uint8_t c)
 
 int begin_layer(FILE *f, const char *name, sld_layer_t *layer)
 {
+    (void)name;
     layer->read_start = ftell(f);
     if (fread(&layer->content_length, sizeof(uint32_t), 1, f) != 1)
     {
@@ -137,8 +217,8 @@ int begin_layer(FILE *f, const char *name, sld_layer_t *layer)
     }
 
     layer->actual_length = (layer->content_length + 3) & ~3;
-    printf("    %s\n      sld_layer_length=%d\n      actual_length=%d\n", name, layer->content_length,
-           layer->actual_length);
+    DEBUG_PRINTF("    %s\n      sld_layer_length=%d\n      actual_length=%d\n", name, layer->content_length,
+                 layer->actual_length);
     return 1;
 }
 
@@ -154,7 +234,7 @@ int read_layer_commands(FILE *f, sld_layer_t *layer)
         printf("command_array_length %d is bigger than %d\n", layer->command_array_length, MAX_COMMANDS);
         return 0;
     }
-    printf("      command_array_length=%d\n", layer->command_array_length);
+    DEBUG_PRINTF("      command_array_length=%d\n", layer->command_array_length);
     if (fread(layer->commands, sizeof(command_t), layer->command_array_length, f) != layer->command_array_length)
     {
         printf("commands err\n");
@@ -166,13 +246,15 @@ int read_layer_commands(FILE *f, sld_layer_t *layer)
 int finish_layer(FILE *f, sld_layer_t *layer)
 {
     long read = ftell(f) - layer->read_start;
-    printf("      null bytes %ld\n", layer->actual_length - read);
+    DEBUG_PRINTF("      null bytes %ld\n", layer->actual_length - read);
     return fseek(f, layer->actual_length - read, SEEK_CUR) == 0;
 }
 
-void decode_dxt4(bc4_t block, int block_x, int block_y, uint8_t *canvas, uint16_t offset_x1, uint16_t offset_y1,
-                 uint16_t canvas_width, dxt4_pixel_writer_t write_pixel)
+void decode_dxt4(const void *block_ptr, int block_x, int block_y, uint8_t *canvas, uint16_t offset_x1,
+                 uint16_t offset_y1, uint16_t canvas_width, void *pixel_writer)
 {
+    bc4_t block = *(const bc4_t *)block_ptr;
+    dxt4_pixel_writer_t write_pixel = (dxt4_pixel_writer_t)pixel_writer;
     uint16_t colors[8];
     colors[0] = block.color0;
     colors[1] = block.color1;
@@ -219,9 +301,11 @@ void decode_dxt4(bc4_t block, int block_x, int block_y, uint8_t *canvas, uint16_
     }
 }
 
-void decode_dxt1(bc1_t block, int block_x, int block_y, uint8_t *canvas, uint16_t offset_x1, uint16_t offset_y1,
-                 uint16_t canvas_width)
+void decode_dxt1(const void *block_ptr, int block_x, int block_y, uint8_t *canvas, uint16_t offset_x1,
+                 uint16_t offset_y1, uint16_t canvas_width, void *pixel_writer)
 {
+    bc1_t block = *(const bc1_t *)block_ptr;
+    dxt1_pixel_writer_t write_pixel = (dxt1_pixel_writer_t)pixel_writer;
     uint16_t colors[4];
     colors[0] = block.color0;
     colors[1] = block.color1;
@@ -250,11 +334,38 @@ void decode_dxt1(bc1_t block, int block_x, int block_y, uint8_t *canvas, uint16_
         int canvas_px = offset_x1 + px;
         int canvas_py = offset_y1 + py;
         int canvas_idx = (canvas_py * canvas_width + canvas_px) * 4;
-        canvas[canvas_idx + 0] = ((c >> 11) & 0x1F) * 255 / 31;
-        canvas[canvas_idx + 1] = ((c >> 5) & 0x3F) * 255 / 63;
-        canvas[canvas_idx + 2] = (c & 0x1F) * 255 / 31;
-        canvas[canvas_idx + 3] = (colors[0] <= colors[1] && color_idx == 3) ? 0 : 255;
+        write_pixel(canvas + canvas_idx, c, colors[0] <= colors[1] && color_idx == 3);
     }
+}
+
+int render_blocks(FILE *f, sld_layer_t *layer, int width, size_t block_size, uint8_t *canvas, uint16_t offset_x1,
+                  uint16_t offset_y1, uint16_t canvas_width, decode_method_t decode_method, void *pixel_writer)
+{
+    int blocks_wide = width / 4;
+    int block_x = 0;
+    int block_y = 0;
+    uint8_t block[sizeof(bc4_t)];
+
+    for (int i = 0; i < layer->command_array_length; i++)
+    {
+        command_t cmd = layer->commands[i];
+        block_y += (block_x + cmd.skipped) / blocks_wide;
+        block_x = (block_x + cmd.skipped) % blocks_wide;
+
+        for (int j = 0; j < cmd.drawn; j++)
+        {
+            if (fread(block, block_size, 1, f) != 1)
+            {
+                printf("block err\n");
+                return 0;
+            }
+            decode_method(block, block_x, block_y, canvas, offset_x1, offset_y1, canvas_width, pixel_writer);
+            block_y += (block_x + 1) / blocks_wide;
+            block_x = (block_x + 1) % blocks_wide;
+        }
+    }
+
+    return 1;
 }
 
 int main(int argc, char **argv)
@@ -272,7 +383,9 @@ int main(int argc, char **argv)
         return 1;
     }
     char *fn = filename(argv[1]);
-    printf("%s\n", fn);
+    char stemmed[200];
+    stem(argv[1], stemmed, sizeof(stemmed));
+    DEBUG_PRINTF("%s\n", fn);
 
     sld_header_t sld_header = {0};
     if (fread(&sld_header, sizeof(sld_header_t), 1, f) != 1)
@@ -280,26 +393,27 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    printf("%.4s version=%d\nframes=%d\n", sld_header.signature, sld_header.version, sld_header.frame_count);
+    DEBUG_PRINTF("%.4s version=%d\nframes=%d\n", sld_header.signature, sld_header.version, sld_header.frame_count);
 
     sld_frame_header_t sld_frame_header = {0};
     if (fread(&sld_frame_header, sizeof(sld_frame_header_t), 1, f) != 1)
     {
         return 1;
     }
-    printf("  frame_type=" BYTE_TO_BINARY_PATTERN "\n", BYTE_TO_BINARY(sld_frame_header.frame_type));
+    DEBUG_PRINTF("  frame_type=" BYTE_TO_BINARY_PATTERN "\n", BYTE_TO_BINARY(sld_frame_header.frame_type));
 
     size_t canvas_size = sld_frame_header.canvas_width * sld_frame_header.canvas_height * 4;
     uint8_t *main_canvas = calloc(canvas_size, sizeof(uint8_t));
     uint8_t *shadow_canvas = calloc(canvas_size, sizeof(uint8_t));
     uint8_t *playercolor_canvas = calloc(canvas_size, sizeof(uint8_t));
+    sld_layer_t layer = {0};
 
     int main_width = 0;
-    uint16_t main_offset_x1 = 0, main_offset_y1 = 0;
+    uint16_t main_offset_x1 = 0, main_offset_y1 = 0, main_offset_x2 = 0;
 
     if (sld_frame_header.frame_type & 1) // main graphic
     {
-        sld_layer_t layer = {0};
+        memset(&layer, 0, sizeof(layer));
         if (!begin_layer(f, "main", &layer))
         {
             return 1;
@@ -311,46 +425,21 @@ int main(int argc, char **argv)
             return 1;
         }
 
-        printf("      flag1=" BYTE_TO_BINARY_PATTERN "\n", BYTE_TO_BINARY(sld_main_header.flag1));
+        DEBUG_PRINTF("      flag1=" BYTE_TO_BINARY_PATTERN "\n", BYTE_TO_BINARY(sld_main_header.flag1));
         main_offset_x1 = sld_main_header.offset_x1;
         main_offset_y1 = sld_main_header.offset_y1;
+        main_offset_x2 = sld_main_header.offset_x2;
         main_width = sld_main_header.offset_x2 - sld_main_header.offset_x1;
         if (!read_layer_commands(f, &layer))
         {
             return 1;
         }
 
-        int blocks_wide = main_width / 4;
-        // printf("width=%d height=%d\n", width, height);
-        // printf("blocks=%dx%d\n", blocks_wide, blocks_tall);
-
-        int block_x = 0;
-        int block_y = 0;
-        for (int i = 0; i < layer.command_array_length; i++)
+        if (!render_blocks(f, &layer, main_width, sizeof(bc1_t), main_canvas, sld_main_header.offset_x1,
+                           sld_main_header.offset_y1, sld_frame_header.canvas_width, decode_dxt1,
+                           (void *)write_main_pixel))
         {
-            command_t cmd = layer.commands[i];
-
-            int drawn = cmd.drawn;
-            int skipped = cmd.skipped;
-            // printf("command %d %d\n", drawn, skipped);
-
-            block_y += (block_x + skipped) / blocks_wide;
-            block_x = (block_x + skipped) % blocks_wide;
-
-            for (int j = 0; j < drawn; j++)
-            {
-                bc1_t block;
-                if (fread(&block, sizeof(bc1_t), 1, f) != 1)
-                {
-                    printf("block err\n");
-                    return 1;
-                }
-                decode_dxt1(block, block_x, block_y, main_canvas, sld_main_header.offset_x1, sld_main_header.offset_y1,
-                            sld_frame_header.canvas_width);
-
-                block_y += (block_x + 1) / blocks_wide;
-                block_x = (block_x + 1) % blocks_wide;
-            }
+            return 1;
         }
         if (!finish_layer(f, &layer))
         {
@@ -359,7 +448,7 @@ int main(int argc, char **argv)
     }
     if (sld_frame_header.frame_type & 2) // shadow
     {
-        sld_layer_t layer = {0};
+        memset(&layer, 0, sizeof(layer));
         if (!begin_layer(f, "shadow", &layer))
         {
             return 1;
@@ -370,45 +459,18 @@ int main(int argc, char **argv)
         {
             return 1;
         }
-        printf("      flag1=" BYTE_TO_BINARY_PATTERN "\n", BYTE_TO_BINARY(sld_shadow_header.flag1));
+        DEBUG_PRINTF("      flag1=" BYTE_TO_BINARY_PATTERN "\n", BYTE_TO_BINARY(sld_shadow_header.flag1));
         int width = sld_shadow_header.offset_x2 - sld_shadow_header.offset_x1;
         if (!read_layer_commands(f, &layer))
         {
             return 1;
         }
 
-        int blocks_wide = width / 4;
-        // printf("width=%d height=%d\n", width, height);
-        // printf("blocks=%dx%d\n", blocks_wide, blocks_tall);
-
-        int block_x = 0;
-        int block_y = 0;
-        for (int i = 0; i < layer.command_array_length; i++)
+        if (!render_blocks(f, &layer, width, sizeof(bc4_t), shadow_canvas, sld_shadow_header.offset_x1,
+                           sld_shadow_header.offset_y1, sld_frame_header.canvas_width, decode_dxt4,
+                           (void *)write_shadow_pixel))
         {
-            command_t cmd = layer.commands[i];
-
-            int drawn = cmd.drawn;
-            int skipped = cmd.skipped;
-            // printf("command %d %d\n", drawn, skipped);
-
-            block_y += (block_x + skipped) / blocks_wide;
-            block_x = (block_x + skipped) % blocks_wide;
-
-            for (int j = 0; j < drawn; j++)
-            {
-                bc4_t block;
-                if (fread(&block, sizeof(bc4_t), 1, f) != 1)
-                {
-                    printf("block err\n");
-                    return 1;
-                }
-
-                decode_dxt4(block, block_x, block_y, shadow_canvas, sld_shadow_header.offset_x1,
-                            sld_shadow_header.offset_y1, sld_frame_header.canvas_width, write_shadow_pixel);
-
-                block_y += (block_x + 1) / blocks_wide;
-                block_x = (block_x + 1) % blocks_wide;
-            }
+            return 1;
         }
         if (!finish_layer(f, &layer))
         {
@@ -417,7 +479,7 @@ int main(int argc, char **argv)
     }
     if (sld_frame_header.frame_type & 4) // ???
     {
-        sld_layer_t layer = {0};
+        memset(&layer, 0, sizeof(layer));
         if (!begin_layer(f, "???", &layer))
         {
             return 1;
@@ -429,7 +491,7 @@ int main(int argc, char **argv)
     }
     if (sld_frame_header.frame_type & 8) // damage mask
     {
-        sld_layer_t layer = {0};
+        memset(&layer, 0, sizeof(layer));
         if (!begin_layer(f, "damage", &layer))
         {
             return 1;
@@ -447,7 +509,7 @@ int main(int argc, char **argv)
             return 1;
         }
 
-        sld_layer_t layer = {0};
+        memset(&layer, 0, sizeof(layer));
         if (!begin_layer(f, "playercolor", &layer))
         {
             return 1;
@@ -458,45 +520,17 @@ int main(int argc, char **argv)
         {
             return 1;
         }
-        printf("      flag1=" BYTE_TO_BINARY_PATTERN "\n", BYTE_TO_BINARY(sld_playercolor_header.flag1));
+        DEBUG_PRINTF("      flag1=" BYTE_TO_BINARY_PATTERN "\n", BYTE_TO_BINARY(sld_playercolor_header.flag1));
 
         if (!read_layer_commands(f, &layer))
         {
             return 1;
         }
 
-        int blocks_wide = main_width / 4;
-        // printf("width=%d height=%d\n", width, height);
-        // printf("blocks=%dx%d\n", blocks_wide, blocks_tall);
-
-        int block_x = 0;
-        int block_y = 0;
-        for (int i = 0; i < layer.command_array_length; i++)
+        if (!render_blocks(f, &layer, main_width, sizeof(bc4_t), playercolor_canvas, main_offset_x1, main_offset_y1,
+                           sld_frame_header.canvas_width, decode_dxt4, (void *)write_playercolor_pixel))
         {
-            command_t cmd = layer.commands[i];
-
-            int drawn = cmd.drawn;
-            int skipped = cmd.skipped;
-            // printf("command %d %d\n", drawn, skipped);
-
-            block_y += (block_x + skipped) / blocks_wide;
-            block_x = (block_x + skipped) % blocks_wide;
-
-            for (int j = 0; j < drawn; j++)
-            {
-                bc4_t block;
-                if (fread(&block, sizeof(bc4_t), 1, f) != 1)
-                {
-                    printf("block err\n");
-                    return 1;
-                }
-
-                decode_dxt4(block, block_x, block_y, playercolor_canvas, main_offset_x1, main_offset_y1,
-                            sld_frame_header.canvas_width, write_playercolor_pixel);
-
-                block_y += (block_x + 1) / blocks_wide;
-                block_x = (block_x + 1) % blocks_wide;
-            }
+            return 1;
         }
         if (!finish_layer(f, &layer))
         {
@@ -539,30 +573,6 @@ int main(int argc, char **argv)
         }
     }
 
-    char png[128];
-    mkdir("out", 0755);
-
-    snprintf(png, sizeof(png), "out/%s_main.png", fn);
-    stbi_write_png(png, sld_frame_header.canvas_width, sld_frame_header.canvas_height, 4, main_canvas,
-                   sld_frame_header.canvas_width * 4);
-
-    snprintf(png, sizeof(png), "out/%s_shadow.png", fn);
-    stbi_write_png(png, sld_frame_header.canvas_width, sld_frame_header.canvas_height, 4, shadow_canvas,
-                   sld_frame_header.canvas_width * 4);
-
-    snprintf(png, sizeof(png), "out/%s_playercolor.png", fn);
-    stbi_write_png(png, sld_frame_header.canvas_width, sld_frame_header.canvas_height, 4, playercolor_canvas,
-                   sld_frame_header.canvas_width * 4);
-
-    snprintf(png, sizeof(png), "out/%s.png", fn);
-    stbi_write_png(png, sld_frame_header.canvas_width, sld_frame_header.canvas_height, 4, image_canvas,
-                   sld_frame_header.canvas_width * 4);
-
-    free(image_canvas);
-    free(main_canvas);
-    free(shadow_canvas);
-    free(playercolor_canvas);
-
     long final_pos = ftell(f);
     if (fseek(f, 0, SEEK_END) != 0)
     {
@@ -573,9 +583,59 @@ int main(int argc, char **argv)
     {
         return 1;
     }
-    printf("file read check: %s (read=%ld size=%ld)\n", final_pos == file_size ? "complete" : "incomplete", final_pos,
-           file_size);
-
+    DEBUG_PRINTF("file read check: %s (read=%ld size=%ld)\n", final_pos == file_size ? "complete" : "incomplete",
+                 final_pos, file_size);
     fclose(f);
+
+    char png[256];
+    char out_dir[256];
+    mkdir("out", 0755);
+    snprintf(out_dir, sizeof(out_dir), "out/%s", stemmed);
+    mkdir(out_dir, 0755);
+
+    output_path(png, sizeof(png), stemmed, fn, "_main.png");
+    DEBUG_PRINTF("writing %s\n", png);
+    stbi_write_png(png, sld_frame_header.canvas_width, sld_frame_header.canvas_height, 4, main_canvas,
+                   sld_frame_header.canvas_width * 4);
+
+    output_path(png, sizeof(png), stemmed, fn, "_shadow.png");
+    DEBUG_PRINTF("writing %s\n", png);
+    stbi_write_png(png, sld_frame_header.canvas_width, sld_frame_header.canvas_height, 4, shadow_canvas,
+                   sld_frame_header.canvas_width * 4);
+
+    output_path(png, sizeof(png), stemmed, fn, "_playercolor.png");
+    DEBUG_PRINTF("writing %s\n", png);
+    stbi_write_png(png, sld_frame_header.canvas_width, sld_frame_header.canvas_height, 4, playercolor_canvas,
+                   sld_frame_header.canvas_width * 4);
+
+    output_path(png, sizeof(png), stemmed, fn, ".png");
+    if (sld_frame_header.frame_type & 1)
+    {
+        int left_x = main_offset_x1;
+        int right_x = main_offset_x2 - 1;
+        int center_y = sld_frame_header.canvas_hotspot_y;
+        int mid_x = (left_x + right_x) / 2;
+        int half_height = (right_x - left_x) / 4;
+        int top_y = center_y - half_height;
+        int bottom_y = center_y + half_height;
+
+        draw_line(image_canvas, sld_frame_header.canvas_width, sld_frame_header.canvas_height, left_x, center_y, mid_x,
+                  top_y, 0, 0, 255);
+        draw_line(image_canvas, sld_frame_header.canvas_width, sld_frame_header.canvas_height, mid_x, top_y, right_x,
+                  center_y, 0, 0, 255);
+        draw_line(image_canvas, sld_frame_header.canvas_width, sld_frame_header.canvas_height, right_x, center_y, mid_x,
+                  bottom_y, 0, 0, 255);
+        draw_line(image_canvas, sld_frame_header.canvas_width, sld_frame_header.canvas_height, mid_x, bottom_y, left_x,
+                  center_y, 0, 0, 255);
+    }
+    DEBUG_PRINTF("writing %s\n", png);
+    stbi_write_png(png, sld_frame_header.canvas_width, sld_frame_header.canvas_height, 4, image_canvas,
+                   sld_frame_header.canvas_width * 4);
+
+    free(image_canvas);
+    free(main_canvas);
+    free(shadow_canvas);
+    free(playercolor_canvas);
+
     return 0;
 }
