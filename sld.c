@@ -133,8 +133,6 @@ int main(int argc, char **argv)
     }
     printf("  frame_type=" BYTE_TO_BINARY_PATTERN "\n", BYTE_TO_BINARY(sld_frame_header.frame_type));
 
-    uint8_t *image_canvas = calloc(sld_frame_header.canvas_width * sld_frame_header.canvas_height * 4, sizeof(uint8_t));
-
     if (sld_frame_header.frame_type & 1) // main graphic
     {
         uint32_t sld_layer_length;
@@ -236,13 +234,13 @@ int main(int argc, char **argv)
                     image[idx + 2] = (c & 0x1F) * 255 / 31;
                     image[idx + 3] = (colors[0] <= colors[1] && color_idx == 3) ? 0 : 255;
 
-                    int canvas_px = sld_main_header.offset_x1 + px;
-                    int canvas_py = sld_main_header.offset_y1 + py;
-                    int canvas_idx = (canvas_py * sld_frame_header.canvas_width + canvas_px) * 4;
-                    image_canvas[canvas_idx + 0] = ((c >> 11) & 0x1F) * 255 / 31;
-                    image_canvas[canvas_idx + 1] = ((c >> 5) & 0x3F) * 255 / 63;
-                    image_canvas[canvas_idx + 2] = (c & 0x1F) * 255 / 31;
-                    image_canvas[canvas_idx + 3] = (colors[0] <= colors[1] && color_idx == 3) ? 0 : 255;
+                    // int canvas_px = sld_main_header.offset_x1 + px;
+                    // int canvas_py = sld_main_header.offset_y1 + py;
+                    // int canvas_idx = (canvas_py * sld_frame_header.canvas_width + canvas_px) * 4;
+                    // image_canvas[canvas_idx + 0] = ((c >> 11) & 0x1F) * 255 / 31;
+                    // image_canvas[canvas_idx + 1] = ((c >> 5) & 0x3F) * 255 / 63;
+                    // image_canvas[canvas_idx + 2] = (c & 0x1F) * 255 / 31;
+                    // image_canvas[canvas_idx + 3] = (colors[0] <= colors[1] && color_idx == 3) ? 0 : 255;
                 }
 
                 block_y += (block_x + 1) / blocks_wide;
@@ -370,13 +368,13 @@ int main(int argc, char **argv)
                     image[idx + 2] = 0;
                     image[idx + 3] = c;
 
-                    int canvas_px = sld_shadow_header.offset_x1 + px;
-                    int canvas_py = sld_shadow_header.offset_y1 + py;
-                    int canvas_idx = (canvas_py * sld_frame_header.canvas_width + canvas_px) * 4;
-                    float a = c / 255.0f; // also see point 2
-                    image_canvas[canvas_idx + 0] = (uint8_t)(image_canvas[canvas_idx + 0] * (1.0f - a));
-                    image_canvas[canvas_idx + 1] = (uint8_t)(image_canvas[canvas_idx + 1] * (1.0f - a));
-                    image_canvas[canvas_idx + 2] = (uint8_t)(image_canvas[canvas_idx + 2] * (1.0f - a));
+                    // int canvas_px = sld_shadow_header.offset_x1 + px;
+                    // int canvas_py = sld_shadow_header.offset_y1 + py;
+                    // int canvas_idx = (canvas_py * sld_frame_header.canvas_width + canvas_px) * 4;
+                    // float a = c / 255.0f; // also see point 2
+                    // image_canvas[canvas_idx + 0] = (uint8_t)(image_canvas[canvas_idx + 0] * (1.0f - a));
+                    // image_canvas[canvas_idx + 1] = (uint8_t)(image_canvas[canvas_idx + 1] * (1.0f - a));
+                    // image_canvas[canvas_idx + 2] = (uint8_t)(image_canvas[canvas_idx + 2] * (1.0f - a));
                 }
 
                 block_y += (block_x + 1) / blocks_wide;
@@ -399,11 +397,15 @@ int main(int argc, char **argv)
     {
     }
 
+    uint8_t *image_canvas = calloc(sld_frame_header.canvas_width * sld_frame_header.canvas_height * 4, sizeof(uint8_t));
+
     char png[128];
     snprintf(png, sizeof(png), "out/%s.png", fn);
     mkdir("out", 0755);
     stbi_write_png(png, sld_frame_header.canvas_width, sld_frame_header.canvas_height, 4, image_canvas,
                    sld_frame_header.canvas_width * 4);
+    // todo compose
+
     free(image_canvas);
 
     fclose(f);
